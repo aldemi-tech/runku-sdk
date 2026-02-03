@@ -1,5 +1,8 @@
 import { EventEmitter } from 'eventemitter3';
 
+// Type alias for IDs (ObjectId as hex string)
+export type ID = string;
+
 export interface RunkuConfig {
   projectId: string;
   apiKey?: string;
@@ -7,29 +10,52 @@ export interface RunkuConfig {
   wsUrl?: string;
 }
 
+// Pagination metadata (only-with-pagination principle)
+export interface Meta {
+  cursor?: string;
+  nextCursor?: string;
+  prevCursor?: string;
+  hasMore: boolean;
+  limit: number;
+  total?: number;
+}
+
+// Paginated response structure
+export interface PaginatedResponse<T> {
+  success: boolean;
+  data: T[];
+  meta: Meta;
+}
+
+// Single item response structure
+export interface SingleResponse<T> {
+  success: boolean;
+  data: T;
+}
+
 export interface QueryOptions {
   limit?: number;
-  skip?: number;
+  cursor?: string;
   sort?: Record<string, 1 | -1>;
   projection?: Record<string, 0 | 1>;
 }
 
 export interface Document {
-  _id: string;
+  id: ID;
   [key: string]: any;
 }
 
 export interface InsertResult {
-  insertedId: string;
+  id: ID;
 }
 
 export interface UpdateResult {
-  matchedCount: number;
-  modifiedCount: number;
+  id: ID;
+  modified: boolean;
 }
 
 export interface DeleteResult {
-  deletedCount: number;
+  deleted: boolean;
 }
 
 export interface ExecuteResult<T = any> {
@@ -71,115 +97,285 @@ class RunkuError extends Error {
   }
 }
 
+// Cursor-based iterator for paginated results
+export class CursorIterator<T> implements AsyncIterable<T> {
+  private currentBatch: T[] = [];
+  private batchIndex = 0;
+  private cursor: string | undefined;
+  private _hasMore = true;
+  private batchSizeValue: number;
+
+  constructor(
+    private fetchBatch: (cursor?: string, limit?: number) => Promise<PaginatedResponse<T>>,
+    batchSize: number = 20
+  ) {
+    this.batchSizeValue = batchSize;
+  }
+
+  hasMore(): boolean {
+    return this._hasMore || this.batchIndex < this.currentBatch.length;
+  }
+
+  async nextBatch(): Promise<T[]> {
+    if (!this._hasMore && this.currentBatch.length === 0) {
+      return [];
+    }
+
+    const response = await this.fetchBatch(this.cursor, this.batchSizeValue);
+    this.currentBatch = response.data;
+    this.batchIndex = 0;
+    this._hasMore = response.meta.hasMore;
+    this.cursor = response.meta.nextCursor;
+
+    return this.currentBatch;
+  }
+
+  async *[Symbol.asyncIterator](): AsyncIterator<T> {
+    while (this.hasMore()) {
+      if (this.batchIndex >= this.currentBatch.length) {
+        if (!this._hasMore && this.currentBatch.length > 0) {
+          return;
+        }
+        await this.nextBatch();
+        if (this.currentBatch.length === 0) {
+          return;
+        }
+      }
+      yield this.currentBatch[this.batchIndex++];
+    }
+  }
+
+  batchSize(size: number): CursorIterator<T> {
+    this.batchSizeValue = size;
+    return this;
+  }
+}
+
+// Query builder for fluent API
+export class QueryBuilder<T extends Document = Document> {
+  private _filter: Record<string, any> = {};
+  private _sort?: Record<string, 1 | -1>;
+  private _limit?: number;
+  private _cursor?: string;
+  private _projection?: Record<string, 0 | 1>;
+
+  constructor(
+    private collection: string,
+    private client: DatabaseClient
+  ) {}
+
+  filter(filter: Record<string, any>): QueryBuilder<T> {
+    this._filter = { ...this._filter, ...filter };
+    return this;
+  }
+
+  sort(sort: Record<string, 1 | -1>): QueryBuilder<T> {
+    this._sort = sort;
+    return this;
+  }
+
+  limit(limit: number): QueryBuilder<T> {
+    this._limit = limit;
+    return this;
+  }
+
+  cursor(cursor: string): QueryBuilder<T> {
+    this._cursor = cursor;
+    return this;
+  }
+
+  project(projection: Record<string, 0 | 1>): QueryBuilder<T> {
+    this._projection = projection;
+    return this;
+  }
+
+  // Execute query and return paginated result
+  async exec(): Promise<PaginatedResponse<T>> {
+    return this.client.queryRaw<T>(this.collection, this._filter, {
+      sort: this._sort,
+      limit: this._limit,
+      cursor: this._cursor,
+      projection: this._projection,
+    });
+  }
+
+  // Get iterator for batch processing
+  iterator(): CursorIterator<T> {
+    return new CursorIterator<T>(
+      (cursor, limit) => this.client.queryRaw<T>(this.collection, this._filter, {
+        sort: this._sort,
+        limit: limit || this._limit,
+        cursor,
+        projection: this._projection,
+      }),
+      this._limit || 20
+    );
+  }
+
+  // Load all results up to a maximum (with safety limit)
+  async toArray(options?: { maxItems?: number }): Promise<T[]> {
+    const maxItems = options?.maxItems || 10000;
+    const results: T[] = [];
+    const iterator = this.iterator();
+
+    for await (const item of iterator) {
+      results.push(item);
+      if (results.length >= maxItems) {
+        break;
+      }
+    }
+
+    return results;
+  }
+}
+
 class DatabaseClient {
   constructor(private client: RunkuClient) {}
 
+  // Create a query builder for fluent API
+  collection<T extends Document = Document>(name: string): QueryBuilder<T> {
+    return new QueryBuilder<T>(name, this);
+  }
+
+  // Raw query with pagination (internal use)
+  async queryRaw<T extends Document = Document>(
+    collection: string,
+    filter: Record<string, any> = {},
+    options: QueryOptions = {}
+  ): Promise<PaginatedResponse<T>> {
+    const params = new URLSearchParams();
+    if (Object.keys(filter).length > 0) {
+      params.set('filter', JSON.stringify(filter));
+    }
+    if (options.sort) {
+      params.set('sort', JSON.stringify(options.sort));
+    }
+    if (options.limit) {
+      params.set('limit', String(options.limit));
+    }
+    if (options.cursor) {
+      params.set('cursor', options.cursor);
+    }
+    
+    const query = params.toString();
+    return this.client.request<PaginatedResponse<T>>(
+      `/data/${collection}${query ? `?${query}` : ''}`
+    );
+  }
+
+  // Convenience method for simple queries
   async query<T extends Document = Document>(
     collection: string,
     filter: Record<string, any> = {},
     options: QueryOptions = {}
   ): Promise<T[]> {
-    const response = await this.client.request<{ documents: T[] }>(
-      `/data/${collection}/query`,
-      {
-        method: 'POST',
-        body: JSON.stringify({ filter, ...options }),
-      }
-    );
-    return response.documents;
+    const response = await this.queryRaw<T>(collection, filter, options);
+    return response.data;
   }
 
   async findOne<T extends Document = Document>(
     collection: string,
     filter: Record<string, any>
   ): Promise<T | null> {
-    const docs = await this.query<T>(collection, filter, { limit: 1 });
-    return docs[0] || null;
+    const response = await this.queryRaw<T>(collection, filter, { limit: 1 });
+    return response.data[0] || null;
   }
 
   async findById<T extends Document = Document>(
     collection: string,
-    id: string
+    id: ID
   ): Promise<T | null> {
-    return this.findOne<T>(collection, { _id: id });
+    try {
+      const response = await this.client.request<SingleResponse<T>>(`/data/${collection}/${id}`);
+      return response.data;
+    } catch (err) {
+      if (err instanceof RunkuError && err.status === 404) {
+        return null;
+      }
+      throw err;
+    }
   }
 
   async insert<T extends Document = Document>(
     collection: string,
-    document: Omit<T, '_id'>
+    document: Omit<T, 'id'>
   ): Promise<InsertResult> {
-    return this.client.request<InsertResult>(`/data/${collection}`, {
+    const response = await this.client.request<SingleResponse<InsertResult>>(`/data/${collection}`, {
       method: 'POST',
       body: JSON.stringify(document),
     });
+    return response.data;
   }
 
   async insertMany<T extends Document = Document>(
     collection: string,
-    documents: Omit<T, '_id'>[]
-  ): Promise<{ insertedIds: string[] }> {
-    return this.client.request<{ insertedIds: string[] }>(`/data/${collection}/bulk`, {
+    documents: Omit<T, 'id'>[]
+  ): Promise<{ ids: ID[] }> {
+    const response = await this.client.request<SingleResponse<{ ids: ID[] }>>(`/data/${collection}/bulk`, {
       method: 'POST',
       body: JSON.stringify({ documents }),
     });
+    return response.data;
   }
 
   async update(
     collection: string,
-    filter: Record<string, any>,
+    id: ID,
     update: Record<string, any>
   ): Promise<UpdateResult> {
-    return this.client.request<UpdateResult>(`/data/${collection}/update`, {
-      method: 'POST',
-      body: JSON.stringify({ filter, update }),
+    const response = await this.client.request<SingleResponse<UpdateResult>>(`/data/${collection}/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(update),
     });
+    return response.data;
   }
 
-  async updateById(
-    collection: string,
-    id: string,
-    update: Record<string, any>
-  ): Promise<UpdateResult> {
-    return this.update(collection, { _id: id }, update);
-  }
-
-  async delete(collection: string, filter: Record<string, any>): Promise<DeleteResult> {
-    return this.client.request<DeleteResult>(`/data/${collection}/delete`, {
-      method: 'POST',
-      body: JSON.stringify({ filter }),
+  async delete(collection: string, id: ID): Promise<DeleteResult> {
+    const response = await this.client.request<SingleResponse<DeleteResult>>(`/data/${collection}/${id}`, {
+      method: 'DELETE',
     });
-  }
-
-  async deleteById(collection: string, id: string): Promise<DeleteResult> {
-    return this.delete(collection, { _id: id });
+    return response.data;
   }
 
   async count(collection: string, filter: Record<string, any> = {}): Promise<number> {
-    const response = await this.client.request<{ count: number }>(`/data/${collection}/count`, {
-      method: 'POST',
-      body: JSON.stringify({ filter }),
-    });
-    return response.count;
+    const params = new URLSearchParams();
+    if (Object.keys(filter).length > 0) {
+      params.set('filter', JSON.stringify(filter));
+    }
+    const query = params.toString();
+    const response = await this.client.request<SingleResponse<{ count: number }>>(
+      `/data/${collection}/count${query ? `?${query}` : ''}`
+    );
+    return response.data.count;
   }
 
   async aggregate<T = any>(collection: string, pipeline: Record<string, any>[]): Promise<T[]> {
-    const response = await this.client.request<{ results: T[] }>(`/data/${collection}/aggregate`, {
+    const response = await this.client.request<PaginatedResponse<T>>(`/data/${collection}/aggregate`, {
       method: 'POST',
       body: JSON.stringify({ pipeline }),
     });
-    return response.results;
+    return response.data;
   }
 }
 
 class StorageClient {
   constructor(private client: RunkuClient) {}
 
-  async list(prefix?: string, cursor?: string): Promise<{ files: StorageFile[]; cursor?: string }> {
+  async list(prefix?: string, cursor?: string, limit?: number): Promise<PaginatedResponse<StorageFile>> {
     const params = new URLSearchParams();
     if (prefix) params.set('prefix', prefix);
     if (cursor) params.set('cursor', cursor);
+    if (limit) params.set('limit', String(limit));
     const query = params.toString();
     return this.client.request(`/storage${query ? `?${query}` : ''}`);
+  }
+
+  // Get iterator for listing files with pagination
+  listIterator(prefix?: string, batchSize: number = 20): CursorIterator<StorageFile> {
+    return new CursorIterator<StorageFile>(
+      (cursor, limit) => this.list(prefix, cursor, limit || batchSize),
+      batchSize
+    );
   }
 
   async upload(key: string, data: Blob | ArrayBuffer | string, options?: UploadOptions): Promise<StorageFile> {
@@ -404,5 +600,5 @@ export function createClient(config: RunkuConfig): RunkuClient {
   return new RunkuClient(config);
 }
 
-export { RunkuError };
+export { RunkuError, DatabaseClient, StorageClient, FunctionsClient, RealtimeClient };
 export default RunkuClient;
