@@ -1,5 +1,5 @@
 {
-  "name": "@runku/sdk",
+  "name": "@aldemi-tech/runku-sdk",
   "version": "0.1.0",
   "description": "Runku SDK for JavaScript/TypeScript applications",
   "main": "./dist/index.js",
@@ -11,6 +11,14 @@
       "require": "./dist/index.js",
       "types": "./dist/index.d.ts"
     }
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com",
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/aldemi-tech/runku-sdk.git"
   },
   "scripts": {
     "build": "tsup src/index.ts --format cjs,esm --dts",
