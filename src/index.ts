@@ -358,6 +358,71 @@ class DatabaseClient {
   }
 }
 
+// Cron types
+export interface CronJob {
+  id: string;
+  name: string;
+  description?: string;
+  schedule: string;
+  timezone?: string;
+  enabled: boolean;
+  nextRun: string;
+  lastRun?: string;
+  lastStatus?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CronExecution {
+  id: string;
+  cronId: string;
+  cronName: string;
+  scheduledAt: string;
+  startedAt?: string;
+  finishedAt?: string;
+  status: 'pending' | 'running' | 'success' | 'failed';
+  duration?: number;
+  response?: {
+    statusCode?: number;
+    body?: string;
+  };
+  error?: string;
+}
+
+class CronsClient {
+  constructor(private client: RunkuClient) {}
+
+  /**
+   * List all crons for the current environment
+   */
+  async list(): Promise<CronJob[]> {
+    const response = await this.client.request<{ crons: CronJob[]; total: number }>('/crons');
+    return response.crons;
+  }
+
+  /**
+   * Get a specific cron by ID
+   */
+  async get(cronId: string): Promise<CronJob> {
+    return this.client.request<CronJob>(`/crons/${cronId}`);
+  }
+
+  /**
+   * Get execution history for a cron
+   */
+  async executions(cronId: string, limit?: number): Promise<CronExecution[]> {
+    const params = new URLSearchParams();
+    if (limit) {
+      params.set('limit', String(limit));
+    }
+    const query = params.toString();
+    const response = await this.client.request<{ executions: CronExecution[]; total: number }>(
+      `/crons/${cronId}/executions${query ? `?${query}` : ''}`
+    );
+    return response.executions;
+  }
+}
+
 class StorageClient {
   constructor(private client: RunkuClient) {}
 
@@ -524,6 +589,7 @@ export class RunkuClient {
   public storage: StorageClient;
   public functions: FunctionsClient;
   public realtime: RealtimeClient;
+  public crons: CronsClient;
 
   constructor(config: RunkuConfig) {
     this.config = {
@@ -537,6 +603,7 @@ export class RunkuClient {
     this.storage = new StorageClient(this);
     this.functions = new FunctionsClient(this);
     this.realtime = new RealtimeClient(this);
+    this.crons = new CronsClient(this);
   }
 
   getWsUrl(): string {
@@ -600,5 +667,5 @@ export function createClient(config: RunkuConfig): RunkuClient {
   return new RunkuClient(config);
 }
 
-export { RunkuError, DatabaseClient, StorageClient, FunctionsClient, RealtimeClient };
+export { RunkuError, DatabaseClient, StorageClient, FunctionsClient, RealtimeClient, CronsClient };
 export default RunkuClient;
