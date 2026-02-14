@@ -365,12 +365,29 @@ export interface CronJob {
   description?: string;
   schedule: string;
   timezone?: string;
+  action: {
+    type: string;
+    url?: string;
+    method?: string;
+    headers?: Record<string, string>;
+    body?: unknown;
+    handler?: string;
+    params?: Record<string, unknown>;
+    functionName?: string;
+    projectId?: string;
+    environmentId?: string;
+  };
+  system: boolean;
   enabled: boolean;
   nextRun: string;
   lastRun?: string;
   lastStatus?: string;
+  timeout: number;
+  retries: number;
+  priority: string;
   createdAt: string;
   updatedAt: string;
+  createdBy?: string;
 }
 
 export interface CronExecution {
@@ -385,8 +402,23 @@ export interface CronExecution {
   response?: {
     statusCode?: number;
     body?: string;
+    headers?: Record<string, string>;
   };
   error?: string;
+  attempt: number;
+  workerNode: string;
+}
+
+export interface CreateCronOptions {
+  name: string;
+  description?: string;
+  schedule: string;
+  timezone?: string;
+  action: CronJob['action'];
+  enabled?: boolean;
+  timeout?: number;
+  retries?: number;
+  priority?: string;
 }
 
 class CronsClient {
@@ -396,8 +428,8 @@ class CronsClient {
    * List all crons for the current environment
    */
   async list(): Promise<CronJob[]> {
-    const response = await this.client.request<{ crons: CronJob[]; total: number }>('/crons');
-    return response.crons;
+    // Cron-service returns a raw array
+    return this.client.request<CronJob[]>('/crons');
   }
 
   /**
@@ -405,6 +437,40 @@ class CronsClient {
    */
   async get(cronId: string): Promise<CronJob> {
     return this.client.request<CronJob>(`/crons/${cronId}`);
+  }
+
+  /**
+   * Create a new cron job
+   */
+  async create(data: CreateCronOptions): Promise<CronJob> {
+    return this.client.request<CronJob>('/crons', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    });
+  }
+
+  /**
+   * Update a cron job
+   */
+  async update(cronId: string, data: Partial<CreateCronOptions>): Promise<CronJob> {
+    return this.client.request<CronJob>(`/crons/${cronId}`, {
+      method: 'PATCH',
+      body: JSON.stringify(data),
+    });
+  }
+
+  /**
+   * Delete a cron job
+   */
+  async delete(cronId: string): Promise<void> {
+    await this.client.request(`/crons/${cronId}`, { method: 'DELETE' });
+  }
+
+  /**
+   * Trigger a cron job manually
+   */
+  async trigger(cronId: string): Promise<{ message: string; cronId: string }> {
+    return this.client.request(`/crons/${cronId}/trigger`, { method: 'POST' });
   }
 
   /**
@@ -416,10 +482,10 @@ class CronsClient {
       params.set('limit', String(limit));
     }
     const query = params.toString();
-    const response = await this.client.request<{ executions: CronExecution[]; total: number }>(
+    // Cron-service returns a raw array
+    return this.client.request<CronExecution[]>(
       `/crons/${cronId}/executions${query ? `?${query}` : ''}`
     );
-    return response.executions;
   }
 }
 
