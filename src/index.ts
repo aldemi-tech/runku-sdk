@@ -1036,55 +1036,6 @@ class AuthClient extends EventEmitter {
     this.emit('session:destroyed');
   }
 }
-      }
-    };
-
-    this.ws.onclose = () => {
-      this.emit('disconnected');
-      this.scheduleReconnect();
-    };
-
-    this.ws.onerror = () => {
-      this.emit('error', new Error('WebSocket error'));
-    };
-  }
-
-  private scheduleReconnect(): void {
-    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-      this.emit('error', new Error('Max reconnect attempts reached'));
-      return;
-    }
-
-    this.reconnectAttempts++;
-    const delay = this.reconnectDelay * Math.pow(2, this.reconnectAttempts - 1);
-    
-    setTimeout(() => {
-      this.connect();
-    }, delay);
-  }
-
-  private send(data: any): void {
-    if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify(data));
-    }
-  }
-
-  subscribe(collection: string, filter?: Record<string, any>): void {
-    this.subscriptions.add(collection);
-    this.send({ type: 'subscribe', collection, filter });
-  }
-
-  unsubscribe(collection: string): void {
-    this.subscriptions.delete(collection);
-    this.send({ type: 'unsubscribe', collection });
-  }
-
-  disconnect(): void {
-    this.subscriptions.clear();
-    this.ws?.close();
-    this.ws = null;
-  }
-}
 
 export class RunkuClient {
   private config: Required<Omit<RunkuConfig, 'onTokenRefresh'>> & { onTokenRefresh?: (tokens: AuthTokens) => void };
@@ -1233,5 +1184,4 @@ export function createClient(config: RunkuConfig): RunkuClient {
 }
 
 export { RunkuError, DatabaseClient, StorageClient, FunctionsClient, RealtimeClient, CronsClient, AuthClient };
-export type { AuthTokens, AppUser, MFASetupResponse, OAuthProvider, LoginResponse };
 export default RunkuClient;
