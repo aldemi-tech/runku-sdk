@@ -110,10 +110,43 @@ export interface ExecuteResult<T = any> {
 }
 
 export interface StorageFile {
+  id?: string;
   key: string;
+  name?: string;
   size: number;
   contentType: string;
-  lastModified: string;
+  lastModified?: string;
+  createdBy?: string;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface StorageBucket {
+  id: string;
+  name: string;
+  visibility: 'public' | 'private';
+  readRule?: string;
+  writeRule?: string;
+  deleteRule?: string;
+  allowedMimeTypes?: string[];
+  maxFileSize?: number;
+  fileCount?: number;
+  totalSize?: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface FunctionMeta {
+  id: string;
+  name: string;
+  description?: string;
+  runtime: 'edge' | 'heavy';
+  requiresAuth: boolean;
+  allowedRoles?: string[];
+  inputParams?: Record<string, any>;
+  enabled: boolean;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface UploadOptions {
@@ -537,6 +570,42 @@ class CronsClient {
 class StorageClient {
   constructor(private client: RunkuClient) {}
 
+  /**
+   * Get a bucket-scoped client for operations within a specific bucket
+   */
+  bucket(bucketId: string): BucketClient {
+    return new BucketClient(this.client, bucketId);
+  }
+
+  /**
+   * List all buckets in the current environment
+   */
+  async listBuckets(): Promise<StorageBucket[]> {
+    const response = await this.client.storageRequest<{ success: boolean; data: StorageBucket[] }>('/buckets');
+    return response.data;
+  }
+
+  /**
+   * Create a new bucket
+   */
+  async createBucket(config: {
+    name: string;
+    visibility?: 'public' | 'private';
+    readRule?: string;
+    writeRule?: string;
+    deleteRule?: string;
+    allowedMimeTypes?: string[];
+    maxFileSize?: number;
+  }): Promise<StorageBucket> {
+    const response = await this.client.storageRequest<{ success: boolean; data: StorageBucket }>('/buckets', {
+      method: 'POST',
+      body: JSON.stringify(config),
+    });
+    return response.data;
+  }
+
+  // --- Legacy flat storage operations (for backward compatibility) ---
+
   async list(prefix?: string, cursor?: string, limit?: number): Promise<PaginatedResponse<StorageFile>> {
     const params = new URLSearchParams();
     if (prefix) params.set('prefix', prefix);
@@ -546,7 +615,6 @@ class StorageClient {
     return this.client.request(`/storage${query ? `?${query}` : ''}`);
   }
 
-  // Get iterator for listing files with pagination
   listIterator(prefix?: string, batchSize: number = 20): CursorIterator<StorageFile> {
     return new CursorIterator<StorageFile>(
       (cursor, limit) => this.list(prefix, cursor, limit || batchSize),
@@ -593,8 +661,74 @@ class StorageClient {
   }
 }
 
+/**
+ * Bucket-scoped storage client for operations within a specific bucket
+ */
+class BucketClient {
+  constructor(private client: RunkuClient, private bucketId: string) {}
+
+  async list(prefix?: string, cursor?: string, limit?: number): Promise<PaginatedResponse<StorageFile>> {
+    const params = new URLSearchParams();
+    if (prefix) params.set('prefix', prefix);
+    if (cursor) params.set('cursor', cursor);
+    if (limit) params.set('limit', String(limit));
+    const query = params.toString();
+    return this.client.storageRequest(`/buckets/${this.bucketId}/files${query ? `?${query}` : ''}`);
+  }
+
+  listIterator(prefix?: string, batchSize: number = 20): CursorIterator<StorageFile> {
+    return new CursorIterator<StorageFile>(
+      (cursor, limit) => this.list(prefix, cursor, limit || batchSize),
+      batchSize
+    );
+  }
+
+  async upload(key: string, data: Blob | ArrayBuffer | string, options?: UploadOptions): Promise<StorageFile> {
+    const formData = new FormData();
+    
+    if (typeof data === 'string') {
+      formData.append('file', new Blob([data], { type: options?.contentType || 'text/plain' }), key);
+    } else if (data instanceof ArrayBuffer) {
+      formData.append('file', new Blob([data], { type: options?.contentType }), key);
+    } else {
+      formData.append('file', data, key);
+    }
+
+    formData.append('path', key);
+
+    if (options?.metadata) {
+      formData.append('metadata', JSON.stringify(options.metadata));
+    }
+
+    return this.client.storageRequest<StorageFile>(`/buckets/${this.bucketId}/upload`, {
+      method: 'POST',
+      body: formData,
+      headers: {},
+    });
+  }
+
+  async download(key: string): Promise<Blob> {
+    const response = await this.client.rawStorageRequest(`/buckets/${this.bucketId}/files/${encodeURIComponent(key)}`);
+    return response.blob();
+  }
+
+  async delete(key: string): Promise<void> {
+    await this.client.storageRequest(`/buckets/${this.bucketId}/files/${encodeURIComponent(key)}`, {
+      method: 'DELETE',
+    });
+  }
+}
+
 class FunctionsClient {
   constructor(private client: RunkuClient) {}
+
+  /**
+   * List all available functions for the current environment
+   */
+  async list(): Promise<FunctionMeta[]> {
+    const response = await this.client.request<{ success: boolean; data: FunctionMeta[] }>('/functions');
+    return response.data;
+  }
 
   async execute<T = any>(functionName: string, args?: Record<string, any>): Promise<ExecuteResult<T>> {
     return this.client.request<ExecuteResult<T>>(`/execute/${functionName}`, {
@@ -1177,11 +1311,73 @@ export class RunkuClient {
 
     return response;
   }
+
+  /**
+   * Make request to storage routes (different URL pattern: /projects/:pid/storage/environments/:eid/...)
+   */
+  async storageRequest<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
+    const url = `${this.config.baseUrl}/api/v1/projects/${this.config.projectId}/storage/environments/${this.config.environmentId}${endpoint}`;
+    
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      ...(options.headers as Record<string, string>),
+    };
+
+    if (this.accessToken) {
+      headers['Authorization'] = `Bearer ${this.accessToken}`;
+    } else if (this.config.apiKey) {
+      headers['X-API-Key'] = this.config.apiKey;
+    }
+
+    const response = await fetch(url, {
+      ...options,
+      headers,
+    });
+
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({ error: 'Request failed' }));
+      throw new RunkuError(error.error || error.message, error.code || 'UNKNOWN', response.status);
+    }
+
+    if (response.status === 204) {
+      return null as T;
+    }
+
+    return response.json();
+  }
+
+  /**
+   * Make raw request to storage routes (returns Response for binary data)
+   */
+  async rawStorageRequest(endpoint: string, options: RequestInit = {}): Promise<Response> {
+    const url = `${this.config.baseUrl}/api/v1/projects/${this.config.projectId}/storage/environments/${this.config.environmentId}${endpoint}`;
+    
+    const headers: Record<string, string> = {
+      ...(options.headers as Record<string, string>),
+    };
+
+    if (this.accessToken) {
+      headers['Authorization'] = `Bearer ${this.accessToken}`;
+    } else if (this.config.apiKey) {
+      headers['X-API-Key'] = this.config.apiKey;
+    }
+
+    const response = await fetch(url, {
+      ...options,
+      headers,
+    });
+
+    if (!response.ok) {
+      throw new RunkuError('Request failed', 'REQUEST_FAILED', response.status);
+    }
+
+    return response;
+  }
 }
 
 export function createClient(config: RunkuConfig): RunkuClient {
   return new RunkuClient(config);
 }
 
-export { RunkuError, DatabaseClient, StorageClient, FunctionsClient, RealtimeClient, CronsClient, AuthClient };
+export { RunkuError, DatabaseClient, StorageClient, BucketClient, FunctionsClient, RealtimeClient, CronsClient, AuthClient };
 export default RunkuClient;
